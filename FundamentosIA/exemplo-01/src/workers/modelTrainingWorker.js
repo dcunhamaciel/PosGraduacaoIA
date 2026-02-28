@@ -4,6 +4,13 @@ import { workerEvents } from '../events/constants.js';
 console.log('Model training worker initialized');
 let _globalCtx = {};
 
+const WEIGHTS = {
+    category: 0.4,
+    color: 0.3,
+    price: 0.2,
+    age: 0.1,
+};
+
 // 🔢 Normalize continuous values (price, age) to 0–1 range
 // Why? Keeps all features balanced so no one dominates training
 // Formula: (val - min) / (max - min)
@@ -23,10 +30,10 @@ function makeContext(catalog, users) {
     const colors = [...new Set(catalog.map(product => product.color))];
     const categories = [...new Set(catalog.map(product => product.category))];
 
-    const colorIndex = Object.fromEntries(
+    const colorsIndex = Object.fromEntries(
         colors.map((color, index) => [color, index])
     );
-    const categoryIndex = Object.fromEntries(
+    const categoriesIndex = Object.fromEntries(
         categories.map((category, index) => [category, index])
     );
 
@@ -53,8 +60,9 @@ function makeContext(catalog, users) {
     return {
         catalog,
         users,
-        colorIndex,
-        categoryIndex,
+        colorsIndex,
+        categoriesIndex,
+        productAvgAgesNorm,
         minAge,
         maxAge,
         minPrice,
@@ -65,6 +73,34 @@ function makeContext(catalog, users) {
     }
 }
 
+const oneHotWeighted = (index, length, weight) => 
+    tf.oneHot(index, length).mul(weight)
+
+function encodeProduct(product, context) {
+    // normalizando dados para ficar de 0 a 1 e aplicando pesos para balancear a importância de cada feature
+    const price = tf.tensor1d([
+        normalize(product.price, context.minPrice, context.maxPrice) * WEIGHTS.price
+    ]);
+
+    const age = tf.tensor1d([
+        (context.productAvgAgesNorm[product.name] ?? 0.5) * WEIGHTS.age
+    ]);
+
+    const category = oneHotWeighted(
+        context.categoriesIndex[product.category], 
+        context.numCategories, 
+        WEIGHTS.category
+    );
+
+    const color = oneHotWeighted(
+        context.colorsIndex[product.color], 
+        context.numColors, 
+        WEIGHTS.color
+    );
+
+    return tf.concat([price, age, category, color]);
+}
+
 async function trainModel({ users }) {
     console.log('Training model with users:', users)
 
@@ -72,6 +108,16 @@ async function trainModel({ users }) {
 
     const catalog = await (await fetch('/data/products.json')).json()
     const context = makeContext(catalog, users)
+
+    context.productVectors = catalog.map(product => {
+        return {
+            name: product.name,
+            meta: {...product},
+            vector: encodeProduct(product, context).dataSync() // Convertendo tensor para array normal para facilitar o uso posterior
+        }
+    })
+
+    _globalCtx = context;
 
     postMessage({
         type: workerEvents.trainingLog,
